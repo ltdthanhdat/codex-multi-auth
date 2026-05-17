@@ -1,9 +1,10 @@
-.PHONY: help install build typecheck lint test clean pack-check run
+.PHONY: help deps install build typecheck lint test clean pack-check run
 
 help:
 	@printf '%s\n' \
 		'Available targets:' \
-		'  make install      Install dependencies' \
+		'  make deps         Install dependencies' \
+		'  make install      Build and install package to global npm bin' \
 		'  make build        Build the project' \
 		'  make typecheck    Run TypeScript typecheck' \
 		'  make lint         Run eslint' \
@@ -12,8 +13,12 @@ help:
 		'  make pack-check   Run package budget check' \
 		'  make run ARGS="" Run codex-multi-auth CLI entrypoint'
 
-install:
+deps:
 	npm ci
+
+install: deps build
+	npm install -g .
+	@printf 'Installed binaries to %s/bin\n' "$$(npm config get prefix)"
 
 build:
 	npm run build
