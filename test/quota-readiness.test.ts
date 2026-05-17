@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { isQuotaCacheEntryExhausted } from "../lib/quota-readiness.js";
+import {
+	isQuotaCacheEntryExhausted,
+	normalizeQuotaCacheEntryForDisplay,
+} from "../lib/quota-readiness.js";
 
 describe("quota readiness", () => {
 	it("treats either exhausted quota window as unavailable", () => {
@@ -163,6 +166,41 @@ describe("quota readiness", () => {
 					now,
 				),
 			).toBe(true);
+		});
+	});
+
+	it("normalizes stale persisted 429 snapshots after the primary window rolls over", () => {
+		const now = 10_000;
+		const normalized = normalizeQuotaCacheEntryForDisplay(
+			{
+				updatedAt: now - 60_000,
+				status: 429,
+				model: "gpt-5.3-codex",
+				primary: {
+					usedPercent: 100,
+					windowMinutes: 300,
+					resetAtMs: now - 1,
+				},
+				secondary: {
+					usedPercent: 16,
+					windowMinutes: 10080,
+					resetAtMs: now + 60_000,
+				},
+			},
+			now,
+		);
+		expect(normalized).toMatchObject({
+			status: 200,
+			primary: {
+				usedPercent: 0,
+				windowMinutes: 300,
+				resetAtMs: undefined,
+			},
+			secondary: {
+				usedPercent: 16,
+				windowMinutes: 10080,
+				resetAtMs: now + 60_000,
+			},
 		});
 	});
 });

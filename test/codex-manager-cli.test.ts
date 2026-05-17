@@ -18,7 +18,9 @@ const setCodexCliActiveSelectionMock = vi.fn();
 const loadCodexCliStateMock = vi.fn();
 const promptAddAnotherAccountMock = vi.fn();
 const promptLoginModeMock = vi.fn();
+const isNonInteractiveModeMock = vi.fn();
 const fetchCodexQuotaSnapshotMock = vi.fn();
+const fetchOfficialCurrentRateLimitsSnapshotMock = vi.fn();
 const loadDashboardDisplaySettingsMock = vi.fn();
 const saveDashboardDisplaySettingsMock = vi.fn();
 const loadQuotaCacheMock = vi.fn();
@@ -31,6 +33,7 @@ const bindCodexAppRuntimeRotationMock = vi.fn();
 const getAppBindStatusMock = vi.fn();
 const unbindCodexAppRuntimeRotationMock = vi.fn();
 const selectMock = vi.fn();
+const promptRootCommandTuiMock = vi.fn();
 const confirmMock = vi.fn(async () => true);
 const planOcChatgptSyncMock = vi.fn();
 const applyOcChatgptSyncMock = vi.fn();
@@ -157,6 +160,11 @@ vi.mock("../lib/runtime/app-bind.js", () => ({
 vi.mock("../lib/cli.js", () => ({
 	promptAddAnotherAccount: promptAddAnotherAccountMock,
 	promptLoginMode: promptLoginModeMock,
+	isNonInteractiveMode: isNonInteractiveModeMock,
+}));
+
+vi.mock("../lib/codex-manager/commands/root-tui.js", () => ({
+	promptRootCommandTui: promptRootCommandTuiMock,
 }));
 
 vi.mock("../lib/prompts/codex.js", () => ({
@@ -263,6 +271,11 @@ vi.mock("../lib/quota-probe.js", async (importOriginal) => ({
 	...(await importOriginal<typeof import("../lib/quota-probe.js")>()),
 	fetchCodexQuotaSnapshot: fetchCodexQuotaSnapshotMock,
 	formatQuotaSnapshotLine: vi.fn(() => "probe-ok"),
+}));
+
+vi.mock("../lib/official-rate-limits.js", () => ({
+	fetchOfficialCurrentRateLimitsSnapshot:
+		fetchOfficialCurrentRateLimitsSnapshotMock,
 }));
 
 vi.mock("../lib/dashboard-settings.js", () => ({
@@ -722,8 +735,10 @@ describe("codex manager cli commands", () => {
 		loadCodexCliStateMock.mockReset();
 		promptAddAnotherAccountMock.mockReset();
 		promptLoginModeMock.mockReset();
+		isNonInteractiveModeMock.mockReset();
 		promptQuestionMock.mockReset();
 		fetchCodexQuotaSnapshotMock.mockReset();
+		fetchOfficialCurrentRateLimitsSnapshotMock.mockReset();
 		loadDashboardDisplaySettingsMock.mockReset();
 		saveDashboardDisplaySettingsMock.mockReset();
 		loadQuotaCacheMock.mockReset();
@@ -731,6 +746,7 @@ describe("codex manager cli commands", () => {
 		loadPluginConfigMock.mockReset();
 		savePluginConfigMock.mockReset();
 		selectMock.mockReset();
+		promptRootCommandTuiMock.mockReset();
 		loadPersistedRuntimeObservabilitySnapshotMock.mockReset();
 		bindCodexAppRuntimeRotationMock.mockReset();
 		getAppBindStatusMock.mockReset();
@@ -749,6 +765,7 @@ describe("codex manager cli commands", () => {
 			primary: {},
 			secondary: {},
 		});
+		fetchOfficialCurrentRateLimitsSnapshotMock.mockResolvedValue(null);
 		loadQuotaCacheMock.mockResolvedValue({
 			byAccountId: {},
 			byEmail: {},
@@ -768,6 +785,7 @@ describe("codex manager cli commands", () => {
 			accounts: [],
 		};
 		loadCodexCliStateMock.mockResolvedValue(null);
+		isNonInteractiveModeMock.mockReturnValue(false);
 		withAccountStorageTransactionMock.mockImplementation(async (handler) => {
 			const current = await getCurrentAccountSnapshot();
 			return handler(
@@ -938,6 +956,453 @@ describe("codex manager cli commands", () => {
 		restoreTTYDescriptors();
 		vi.unstubAllGlobals();
 		vi.restoreAllMocks();
+	});
+
+	it("opens the root command TUI when no args are provided in TTY mode", async () => {
+		setInteractiveTTY(true);
+		loadAccountsMock.mockResolvedValue({
+			version: 3,
+			activeIndex: 0,
+			activeIndexByFamily: { codex: 0 },
+			accounts: [],
+		});
+		promptRootCommandTuiMock.mockResolvedValue({ type: "cancel" });
+		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+		const { runCodexMultiAuthCli } = await import("../lib/codex-manager.js");
+		const exitCode = await runCodexMultiAuthCli([]);
+
+		expect(exitCode).toBe(0);
+		expect(promptRootCommandTuiMock).toHaveBeenCalledTimes(1);
+		expect(logSpy.mock.calls.flat().map(String)).not.toContain(
+			"Codex Multi-Auth CLI",
+		);
+		logSpy.mockRestore();
+	});
+
+	it("live-refreshes root TUI quota values before rendering when auto-fetch is enabled", async () => {
+		setInteractiveTTY(true);
+		const now = Date.now();
+		loadAccountsMock.mockResolvedValue({
+			version: 3,
+			activeIndex: 0,
+			activeIndexByFamily: { codex: 0 },
+			accounts: [
+				{
+					email: "stale@example.com",
+					accountId: "acc_stale",
+					refreshToken: "refresh-stale",
+					accessToken: "access-stale",
+					expiresAt: now + 3_600_000,
+					addedAt: now - 2_000,
+					lastUsed: now - 2_000,
+					enabled: true,
+				},
+			],
+		});
+		loadDashboardDisplaySettingsMock.mockResolvedValue(
+			createReadyFirstMenuSettings({
+				menuAutoFetchLimits: true,
+				menuQuotaTtlMs: 0,
+			}),
+		);
+		loadQuotaCacheMock.mockResolvedValue({
+			byAccountId: {
+				acc_stale: {
+					updatedAt: now - 60_000,
+					status: 200,
+					model: "gpt-5-codex",
+					primary: {
+						usedPercent: 1,
+						windowMinutes: 300,
+						resetAtMs: now + 1_000,
+					},
+					secondary: {
+						usedPercent: 2,
+						windowMinutes: 10080,
+						resetAtMs: now + 2_000,
+					},
+				},
+			},
+			byEmail: {},
+		});
+		fetchCodexQuotaSnapshotMock.mockResolvedValue({
+			status: 200,
+			model: "gpt-5.3-codex",
+			primary: {
+				usedPercent: 57,
+				windowMinutes: 300,
+				resetAtMs: now + 3_000,
+			},
+			secondary: {
+				usedPercent: 84,
+				windowMinutes: 10080,
+				resetAtMs: now + 4_000,
+			},
+		});
+		saveQuotaCacheMock.mockResolvedValue(undefined);
+		promptRootCommandTuiMock.mockResolvedValue({ type: "cancel" });
+
+		const { runCodexMultiAuthCli } = await import("../lib/codex-manager.js");
+		const exitCode = await runCodexMultiAuthCli([]);
+
+		expect(exitCode).toBe(0);
+		expect(fetchCodexQuotaSnapshotMock).toHaveBeenCalledTimes(1);
+		expect(promptRootCommandTuiMock).toHaveBeenCalledWith(
+			expect.arrayContaining([
+				expect.objectContaining({
+					email: "stale@example.com",
+					quota5hLeftPercent: 43,
+					quota7dLeftPercent: 16,
+				}),
+			]),
+			expect.any(Object),
+		);
+	});
+
+	it("prefers official Codex app-server rate limits for the current root TUI account", async () => {
+		setInteractiveTTY(true);
+		const now = Date.now();
+		loadAccountsMock.mockResolvedValue({
+			version: 3,
+			activeIndex: 0,
+			activeIndexByFamily: { codex: 0 },
+			accounts: [
+				{
+					email: "current@example.com",
+					accountId: "acc_current",
+					refreshToken: "refresh-current",
+					accessToken: "access-current",
+					expiresAt: now + 3_600_000,
+					addedAt: now - 2_000,
+					lastUsed: now - 2_000,
+					enabled: true,
+				},
+			],
+		});
+		loadDashboardDisplaySettingsMock.mockResolvedValue(
+			createReadyFirstMenuSettings({
+				menuAutoFetchLimits: true,
+				menuQuotaTtlMs: 0,
+			}),
+		);
+		loadQuotaCacheMock.mockResolvedValue({ byAccountId: {}, byEmail: {} });
+		fetchOfficialCurrentRateLimitsSnapshotMock.mockResolvedValue({
+			status: 200,
+			model: "codex-app-server",
+			primary: {
+				usedPercent: 56,
+				windowMinutes: 300,
+				resetAtMs: now + 3_000,
+			},
+			secondary: {
+				usedPercent: 16,
+				windowMinutes: 10080,
+				resetAtMs: now + 4_000,
+			},
+		});
+		promptRootCommandTuiMock.mockResolvedValue({ type: "cancel" });
+
+		const { runCodexMultiAuthCli } = await import("../lib/codex-manager.js");
+		const exitCode = await runCodexMultiAuthCli([]);
+
+		expect(exitCode).toBe(0);
+		expect(fetchOfficialCurrentRateLimitsSnapshotMock).toHaveBeenCalledTimes(1);
+		expect(fetchCodexQuotaSnapshotMock).not.toHaveBeenCalled();
+		expect(saveQuotaCacheMock).toHaveBeenCalledWith({
+			byAccountId: {
+				acc_current: {
+					updatedAt: expect.any(Number),
+					status: 200,
+					model: "codex-app-server",
+					planType: undefined,
+					primary: {
+						usedPercent: 56,
+						windowMinutes: 300,
+						resetAtMs: now + 3_000,
+					},
+					secondary: {
+						usedPercent: 16,
+						windowMinutes: 10080,
+						resetAtMs: now + 4_000,
+					},
+				},
+			},
+			byEmail: {},
+		});
+		expect(promptRootCommandTuiMock).toHaveBeenCalledWith(
+			expect.arrayContaining([
+				expect.objectContaining({
+					email: "current@example.com",
+					quota5hLeftPercent: 44,
+					quota7dLeftPercent: 84,
+				}),
+			]),
+			expect.any(Object),
+		);
+	});
+
+	it("refreshes distinct quota values for each saved account via official Codex rate-limits", async () => {
+		setInteractiveTTY(true);
+		const now = Date.now();
+		loadAccountsMock.mockResolvedValue({
+			version: 3,
+			activeIndex: 1,
+			activeIndexByFamily: { codex: 1 },
+			accounts: [
+				{
+					email: "one@example.com",
+					accountId: "acc_one",
+					refreshToken: "refresh-one",
+					accessToken: "access-one",
+					expiresAt: now + 3_600_000,
+					addedAt: now - 3_000,
+					lastUsed: now - 3_000,
+					enabled: true,
+				},
+				{
+					email: "two@example.com",
+					accountId: "acc_two",
+					refreshToken: "refresh-two",
+					accessToken: "access-two",
+					expiresAt: now + 3_600_000,
+					addedAt: now - 2_000,
+					lastUsed: now - 2_000,
+					enabled: true,
+				},
+				{
+					email: "three@example.com",
+					accountId: "acc_three",
+					refreshToken: "refresh-three",
+					accessToken: "access-three",
+					expiresAt: now + 3_600_000,
+					addedAt: now - 1_000,
+					lastUsed: now - 1_000,
+					enabled: true,
+				},
+			],
+		});
+		loadDashboardDisplaySettingsMock.mockResolvedValue(
+			createReadyFirstMenuSettings({
+				menuAutoFetchLimits: true,
+				menuQuotaTtlMs: 0,
+				menuSortEnabled: false,
+				menuSortMode: "manual",
+			}),
+		);
+		loadQuotaCacheMock.mockResolvedValue({ byAccountId: {}, byEmail: {} });
+		fetchOfficialCurrentRateLimitsSnapshotMock
+			.mockResolvedValueOnce({
+				status: 200,
+				model: "codex-app-server",
+				primary: { usedPercent: 10, windowMinutes: 300, resetAtMs: now + 1_000 },
+				secondary: { usedPercent: 20, windowMinutes: 10080, resetAtMs: now + 2_000 },
+			})
+			.mockResolvedValueOnce({
+				status: 200,
+				model: "codex-app-server",
+				primary: { usedPercent: 40, windowMinutes: 300, resetAtMs: now + 3_000 },
+				secondary: { usedPercent: 50, windowMinutes: 10080, resetAtMs: now + 4_000 },
+			})
+			.mockResolvedValueOnce({
+				status: 200,
+				model: "codex-app-server",
+				primary: { usedPercent: 70, windowMinutes: 300, resetAtMs: now + 5_000 },
+				secondary: { usedPercent: 80, windowMinutes: 10080, resetAtMs: now + 6_000 },
+			});
+		promptRootCommandTuiMock.mockResolvedValue({ type: "cancel" });
+
+		const { runCodexMultiAuthCli } = await import("../lib/codex-manager.js");
+		const exitCode = await runCodexMultiAuthCli([]);
+
+		expect(exitCode).toBe(0);
+		expect(fetchOfficialCurrentRateLimitsSnapshotMock).toHaveBeenCalledTimes(3);
+		expect(fetchCodexQuotaSnapshotMock).not.toHaveBeenCalled();
+		expect(saveQuotaCacheMock).toHaveBeenCalledWith({
+			byAccountId: {
+				acc_one: {
+					updatedAt: expect.any(Number),
+					status: 200,
+					model: "codex-app-server",
+					planType: undefined,
+					primary: { usedPercent: 10, windowMinutes: 300, resetAtMs: now + 1_000 },
+					secondary: { usedPercent: 20, windowMinutes: 10080, resetAtMs: now + 2_000 },
+				},
+				acc_two: {
+					updatedAt: expect.any(Number),
+					status: 200,
+					model: "codex-app-server",
+					planType: undefined,
+					primary: { usedPercent: 40, windowMinutes: 300, resetAtMs: now + 3_000 },
+					secondary: { usedPercent: 50, windowMinutes: 10080, resetAtMs: now + 4_000 },
+				},
+				acc_three: {
+					updatedAt: expect.any(Number),
+					status: 200,
+					model: "codex-app-server",
+					planType: undefined,
+					primary: { usedPercent: 70, windowMinutes: 300, resetAtMs: now + 5_000 },
+					secondary: { usedPercent: 80, windowMinutes: 10080, resetAtMs: now + 6_000 },
+				},
+			},
+			byEmail: {},
+		});
+		expect(promptRootCommandTuiMock).toHaveBeenCalledWith(
+			expect.arrayContaining([
+				expect.objectContaining({ email: "one@example.com", quota5hLeftPercent: 90, quota7dLeftPercent: 80 }),
+				expect.objectContaining({ email: "two@example.com", quota5hLeftPercent: 60, quota7dLeftPercent: 50 }),
+				expect.objectContaining({ email: "three@example.com", quota5hLeftPercent: 30, quota7dLeftPercent: 20 }),
+			]),
+			expect.any(Object),
+		);
+	});
+
+	it("keeps the root command non-interactive when no args are provided without TTY", async () => {
+		setInteractiveTTY(false);
+		isNonInteractiveModeMock.mockReturnValue(true);
+		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+		const { runCodexMultiAuthCli } = await import("../lib/codex-manager.js");
+		const exitCode = await runCodexMultiAuthCli([]);
+		const renderedLogs = logSpy.mock.calls.flat().map((entry) => String(entry));
+
+		expect(exitCode).toBe(0);
+		expect(promptRootCommandTuiMock).not.toHaveBeenCalled();
+		expect(
+			renderedLogs.some((entry) => entry.includes("Codex Multi-Auth CLI")),
+		).toBe(true);
+		logSpy.mockRestore();
+	});
+
+	it("keeps the root TUI loop alive after switching accounts", async () => {
+		setInteractiveTTY(true);
+		let storageState = {
+			version: 3 as const,
+			activeIndex: 0,
+			activeIndexByFamily: { codex: 0 },
+			accounts: [
+				{
+					email: "one@example.com",
+					refreshToken: "refresh-1",
+					accessToken: "access-1",
+					expiresAt: Date.now() + 60_000,
+					addedAt: 1,
+					lastUsed: 1,
+					enabled: true,
+				},
+				{
+					email: "two@example.com",
+					refreshToken: "refresh-2",
+					accessToken: "access-2",
+					expiresAt: Date.now() + 60_000,
+					addedAt: 2,
+					lastUsed: 2,
+					enabled: true,
+				},
+			],
+		};
+		loadAccountsMock.mockImplementation(async () => structuredClone(storageState));
+		saveAccountsMock.mockImplementation(async (nextStorage) => {
+			storageState = structuredClone(nextStorage);
+		});
+		queuedRefreshMock.mockResolvedValueOnce({
+			type: "success",
+			access: "access-2-refreshed",
+			refresh: "refresh-2",
+			expires: Date.now() + 3_600_000,
+			idToken: "id-2-refreshed",
+		});
+		promptRootCommandTuiMock.mockImplementationOnce(async (_accounts, handlers) => {
+			await handlers?.onSwitch?.(1);
+			return { type: "cancel" };
+		});
+
+		const { runCodexMultiAuthCli } = await import("../lib/codex-manager.js");
+		const exitCode = await runCodexMultiAuthCli([]);
+
+		expect(exitCode).toBe(0);
+		expect(promptRootCommandTuiMock).toHaveBeenCalledTimes(1);
+		expect(storageState.activeIndex).toBe(1);
+		expect(storageState.pinnedAccountIndex).toBe(1);
+		expect(setCodexCliActiveSelectionMock).toHaveBeenCalledWith(
+			expect.objectContaining({
+				email: "two@example.com",
+			}),
+		);
+		expect(promptRootCommandTuiMock).toHaveBeenNthCalledWith(
+			1,
+			expect.arrayContaining([
+				expect.objectContaining({
+					email: "two@example.com",
+				}),
+			]),
+			expect.objectContaining({
+				onRefresh: expect.any(Function),
+				onSwitch: expect.any(Function),
+			}),
+		);
+	});
+
+	it("dispatches root add-account popup selection into the existing login flow", async () => {
+		setInteractiveTTY(true);
+		const now = Date.now();
+		let storageState = {
+			version: 3 as const,
+			activeIndex: 0,
+			activeIndexByFamily: { codex: 0 },
+			accounts: [
+				{
+					email: "one@example.com",
+					refreshToken: "refresh-1",
+					accessToken: "access-1",
+					expiresAt: now + 60_000,
+					addedAt: 1,
+					lastUsed: 1,
+					enabled: true,
+				},
+			],
+		};
+		loadAccountsMock.mockImplementation(async () => structuredClone(storageState));
+		saveAccountsMock.mockImplementation(async (nextStorage) => {
+			storageState = structuredClone(nextStorage);
+		});
+		promptRootCommandTuiMock
+			.mockResolvedValueOnce({ type: "add", signInMode: "manual" })
+			.mockResolvedValueOnce({ type: "cancel" });
+		promptQuestionMock.mockResolvedValueOnce(
+			"http://127.0.0.1:1455/auth/callback?code=root-oauth-code&state=root-oauth-state",
+		);
+
+		const authModule = await import("../lib/auth/auth.js");
+		vi.mocked(authModule.createAuthorizationFlow).mockResolvedValueOnce({
+			pkce: { challenge: "root-pkce-challenge", verifier: "root-pkce-verifier" },
+			state: "root-oauth-state",
+			url: "https://auth.openai.com/root",
+		});
+		vi.mocked(authModule.exchangeAuthorizationCode).mockResolvedValueOnce({
+			type: "success",
+			access: "access-root-new",
+			refresh: "refresh-root-new",
+			expires: now + 7_200_000,
+			idToken: "id-root-new",
+			multiAccount: true,
+		});
+
+		const browserModule = await import("../lib/auth/browser.js");
+		const openBrowserUrlMock = vi.mocked(browserModule.openBrowserUrl);
+
+		const { runCodexMultiAuthCli } = await import("../lib/codex-manager.js");
+		const exitCode = await runCodexMultiAuthCli([]);
+
+		expect(exitCode).toBe(0);
+		expect(promptRootCommandTuiMock).toHaveBeenCalledTimes(2);
+		expect(openBrowserUrlMock).not.toHaveBeenCalled();
+		expect(storageState.accounts).toHaveLength(2);
+		expect(setCodexCliActiveSelectionMock).toHaveBeenCalledWith(
+			expect.objectContaining({
+				refreshToken: "refresh-root-new",
+			}),
+		);
 	});
 
 	it("keeps backend settings schema maps, categories, and defaults aligned", async () => {
@@ -1788,6 +2253,72 @@ describe("codex manager cli commands", () => {
 			},
 			byEmail: {},
 		});
+	});
+
+	it("drops stale persisted 429 quota state before rendering the root TUI", async () => {
+		setInteractiveTTY(true);
+		const now = Date.now();
+		loadAccountsMock.mockResolvedValue({
+			version: 3,
+			activeIndex: 0,
+			activeIndexByFamily: { codex: 0 },
+			accounts: [
+				{
+					email: "stale429@example.com",
+					accountId: "acc_stale_429",
+					refreshToken: "refresh-stale-429",
+					accessToken: "access-stale-429",
+					expiresAt: now + 3_600_000,
+					addedAt: now - 2_000,
+					lastUsed: now - 2_000,
+					enabled: true,
+				},
+			],
+		});
+		loadDashboardDisplaySettingsMock.mockResolvedValue(
+			createReadyFirstMenuSettings({
+				menuAutoFetchLimits: false,
+			}),
+		);
+		loadQuotaCacheMock.mockResolvedValue({
+			byAccountId: {
+				acc_stale_429: {
+					updatedAt: now - 60_000,
+					status: 429,
+					model: "gpt-5.3-codex",
+					primary: {
+						usedPercent: 100,
+						windowMinutes: 300,
+						resetAtMs: now - 1,
+					},
+					secondary: {
+						usedPercent: 16,
+						windowMinutes: 10080,
+						resetAtMs: now + 4_000,
+					},
+				},
+			},
+			byEmail: {},
+		});
+		promptRootCommandTuiMock.mockResolvedValueOnce({ type: "cancel" });
+
+		const { runCodexMultiAuthCli } = await import("../lib/codex-manager.js");
+		const exitCode = await runCodexMultiAuthCli([]);
+
+		expect(exitCode).toBe(0);
+		expect(fetchCodexQuotaSnapshotMock).not.toHaveBeenCalled();
+		expect(promptRootCommandTuiMock).toHaveBeenCalledWith(
+			expect.arrayContaining([
+				expect.objectContaining({
+					email: "stale429@example.com",
+					quota5hLeftPercent: 100,
+					quota7dLeftPercent: 84,
+					quotaRateLimited: false,
+					status: "active",
+				}),
+			]),
+			expect.anything(),
+		);
 	});
 
 	it("does not mutate loaded quota cache when live forecast display save fails", async () => {
@@ -3251,6 +3782,46 @@ describe("codex manager cli commands", () => {
 				String(call[0]).includes("live session OK"),
 			),
 		).toBe(true);
+	});
+
+	it("does not count codex-unavailable accounts as working during auth check", async () => {
+		const now = Date.now();
+		loadAccountsMock.mockResolvedValueOnce({
+			version: 3,
+			activeIndex: 0,
+			activeIndexByFamily: { codex: 0 },
+			accounts: [
+				{
+					accountId: "acc_nocodex",
+					email: "nocodex@example.com",
+					refreshToken: "refresh-nocodex",
+					accessToken: "access-nocodex",
+					expiresAt: now + 60 * 60 * 1000,
+					addedAt: now - 1_000,
+					lastUsed: now - 1_000,
+					enabled: true,
+				},
+			],
+		});
+		fetchCodexQuotaSnapshotMock.mockRejectedValueOnce(
+			new CodexUnavailableError(
+				"The 'gpt-5-codex' model is not supported when using Codex with a ChatGPT account.",
+			),
+		);
+		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+		const { runCodexMultiAuthCli } = await import("../lib/codex-manager.js");
+
+		const exitCode = await runCodexMultiAuthCli(["auth", "check"]);
+		expect(exitCode).toBe(0);
+		expect(queuedRefreshMock).not.toHaveBeenCalled();
+		expect(setCodexCliActiveSelectionMock).toHaveBeenCalledTimes(1);
+		const lines = logSpy.mock.calls.map((call) => String(call[0]));
+		expect(
+			lines.some((line) => line.includes(CODEX_UNAVAILABLE_PROBE_NOTE_LITERAL)),
+		).toBe(true);
+		expect(lines.some((line) => line.includes("Result: 0 working"))).toBe(true);
+		expect(lines.some((line) => line.includes("1 unavailable"))).toBe(true);
+		expect(lines.join("\n")).not.toContain("is not supported when using Codex");
 	});
 
 	it("does not mutate loaded quota cache when live check account save fails", async () => {

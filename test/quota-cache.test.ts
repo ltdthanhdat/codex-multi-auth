@@ -63,6 +63,31 @@ describe("quota cache", () => {
     expect(fileContent).toContain('"version": 1');
   });
 
+  it("does not persist ephemeral current-session rate-limit snapshots", async () => {
+    const { loadQuotaCache, saveQuotaCache, getQuotaCachePath } =
+      await import("../lib/quota-cache.js");
+
+    await saveQuotaCache({
+      byAccountId: {
+        acc_1: {
+          updatedAt: Date.now(),
+          status: 200,
+          model: "codex-session-rate-limits",
+          planType: "plus",
+          primary: { usedPercent: 55, windowMinutes: 300 },
+          secondary: { usedPercent: 87, windowMinutes: 10080 },
+        },
+      },
+      byEmail: {},
+    });
+
+    const loaded = await loadQuotaCache();
+    expect(loaded).toEqual({ byAccountId: {}, byEmail: {} });
+
+    const fileContent = await fs.readFile(getQuotaCachePath(), "utf8");
+    expect(fileContent).not.toContain("codex-session-rate-limits");
+  });
+
   it("ignores cache files with unsupported version", async () => {
     const { loadQuotaCache, getQuotaCachePath } =
       await import("../lib/quota-cache.js");

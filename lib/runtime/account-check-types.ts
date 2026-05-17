@@ -4,6 +4,7 @@ export type AccountCheckWorkingState = {
 	storageChanged: boolean;
 	flaggedChanged: boolean;
 	ok: number;
+	unavailable: number;
 	errors: number;
 	warnings: number;
 	disabled: number;
@@ -19,6 +20,7 @@ export function createAccountCheckWorkingState(flaggedStorage: {
 		storageChanged: false,
 		flaggedChanged: false,
 		ok: 0,
+		unavailable: 0,
 		errors: 0,
 		warnings: 0,
 		disabled: 0,

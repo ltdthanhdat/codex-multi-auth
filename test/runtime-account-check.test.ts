@@ -384,7 +384,7 @@ describe("runRuntimeAccountCheck", () => {
 		expect(saveFlaggedAccounts.mock.invocationCallOrder[0]).toBeLessThan(saveAccounts.mock.invocationCallOrder[0]);
 	});
 
-	it("treats a codex-unavailable quota probe as a warning, not a hard error", async () => {
+	it("treats a codex-unavailable quota probe as unavailable instead of healthy", async () => {
 		const showLine = vi.fn();
 		const state = {
 			flaggedStorage: { version: 1 as const, accounts: [] },
@@ -392,6 +392,7 @@ describe("runRuntimeAccountCheck", () => {
 			storageChanged: false,
 			flaggedChanged: false,
 			ok: 0,
+			unavailable: 0,
 			errors: 0,
 			warnings: 0,
 			disabled: 0,
@@ -442,10 +443,10 @@ describe("runRuntimeAccountCheck", () => {
 			showLine,
 		});
 
-		// counted as a warning + ok, not an error
-		expect(state.warnings).toBe(1);
+		expect(state.unavailable).toBe(1);
+		expect(state.warnings).toBe(0);
 		expect(state.errors).toBe(0);
-		expect(state.ok).toBe(1);
+		expect(state.ok).toBe(0);
 
 		const lines = showLine.mock.calls.map((call) => String(call[0]));
 		// friendly note is shown without an ERROR prefix or raw JSON
@@ -453,7 +454,10 @@ describe("runRuntimeAccountCheck", () => {
 		expect(noteLine).toBeDefined();
 		expect(noteLine).not.toContain("ERROR");
 		expect(lines.join("\n")).not.toContain("is not supported when using Codex");
-		// summary reflects the warning bucket
-		expect(lines.some((l) => /Results:.*1 warning/.test(l))).toBe(true);
+		expect(
+			lines.some((l) =>
+				/Results: 0 ok, 1 unavailable, 0 error, 0 disabled/.test(l),
+			),
+		).toBe(true);
 	});
 });

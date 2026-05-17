@@ -297,8 +297,7 @@ export async function runRuntimeAccountCheck(
 				);
 			} catch (error) {
 				if (isCodexUnavailableError(error)) {
-					state.warnings += 1;
-					state.ok += 1;
+					state.unavailable = (state.unavailable ?? 0) + 1;
 					deps.showLine(
 						`[${i + 1}/${total}] ${label}: ${CODEX_UNAVAILABLE_PROBE_NOTE}`,
 					);
@@ -348,9 +347,15 @@ export async function runRuntimeAccountCheck(
 
 	deps.showLine("");
 	deps.showLine(
-		state.warnings > 0
-			? `Results: ${state.ok} ok, ${state.warnings} warning, ${state.errors} error, ${state.disabled} disabled`
-			: `Results: ${state.ok} ok, ${state.errors} error, ${state.disabled} disabled`,
+		[
+			`Results: ${state.ok} ok`,
+			`${state.unavailable ?? 0} unavailable`,
+			state.warnings > 0 ? `${state.warnings} warning` : null,
+			`${state.errors} error`,
+			`${state.disabled} disabled`,
+		]
+			.filter((part): part is string => part !== null)
+			.join(", "),
 	);
 	if (state.removeFromActive.size > 0) {
 		deps.showLine(

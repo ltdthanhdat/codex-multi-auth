@@ -30,6 +30,8 @@ interface QuotaCacheFile {
 	byEmail: Record<string, QuotaCacheEntry>;
 }
 
+const EPHEMERAL_QUOTA_MODELS = new Set(["codex-session-rate-limits"]);
+
 const QUOTA_CACHE_PATH = join(getCodexMultiAuthDir(), "quota-cache.json");
 const QUOTA_CACHE_LABEL = basename(QUOTA_CACHE_PATH);
 // Align with the shared FILE_RETRY_CODES taxonomy (lib/fs-retry.ts) so a
@@ -91,10 +93,12 @@ function normalizeEntry(value: unknown): QuotaCacheEntry | null {
 	const updatedAt = normalizeNumber(value.updatedAt);
 	const status = normalizeNumber(value.status);
 	const model = typeof value.model === "string" ? value.model : "";
+	const trimmedModel = model.trim();
 	if (
 		typeof updatedAt !== "number" ||
 		typeof status !== "number" ||
-		model.trim().length === 0
+		trimmedModel.length === 0 ||
+		EPHEMERAL_QUOTA_MODELS.has(trimmedModel)
 	) {
 		return null;
 	}
@@ -102,7 +106,7 @@ function normalizeEntry(value: unknown): QuotaCacheEntry | null {
 	return {
 		updatedAt,
 		status,
-		model: model.trim(),
+		model: trimmedModel,
 		planType: typeof value.planType === "string" ? value.planType : undefined,
 		primary: normalizeWindow(value.primary),
 		secondary: normalizeWindow(value.secondary),
@@ -125,6 +129,17 @@ function normalizeEntryMap(value: unknown): Record<string, QuotaCacheEntry> {
 		const normalized = normalizeEntry(raw);
 		if (!normalized) continue;
 		entries[key] = normalized;
+	}
+	return entries;
+}
+
+function stripEphemeralEntryMap(
+	value: Record<string, QuotaCacheEntry>,
+): Record<string, QuotaCacheEntry> {
+	const entries: Record<string, QuotaCacheEntry> = {};
+	for (const [key, entry] of Object.entries(value)) {
+		if (EPHEMERAL_QUOTA_MODELS.has(entry.model)) continue;
+		entries[key] = entry;
 	}
 	return entries;
 }
@@ -229,8 +244,8 @@ export async function loadQuotaCache(): Promise<QuotaCacheData> {
 export async function saveQuotaCache(data: QuotaCacheData): Promise<void> {
 	const payload: QuotaCacheFile = {
 		version: 1,
-		byAccountId: data.byAccountId,
-		byEmail: data.byEmail,
+		byAccountId: stripEphemeralEntryMap(data.byAccountId),
+		byEmail: stripEphemeralEntryMap(data.byEmail),
 	};
 
 	const writeTask = async (): Promise<void> => {

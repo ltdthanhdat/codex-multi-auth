@@ -12,6 +12,7 @@ import type { ModelFamily } from "../../prompts/codex.js";
 import {
 	findQuotaCacheEntryForAccount,
 	isQuotaCacheEntryExhausted,
+	normalizeQuotaCacheEntryForDisplay,
 } from "../../quota-readiness.js";
 import type { QuotaCacheData } from "../../quota-cache.js";
 import type { AppBindRouterStatus } from "../../runtime/app-bind.js";
@@ -88,7 +89,10 @@ function buildAccountMarkers(
 	markers.push(...resolveAccountCurrentMarkers(index, activeIndex, runtimeCurrent));
 	if (account.enabled === false) markers.push("disabled");
 	if (formatRateLimitEntry(account, now, "codex")) markers.push("rate-limited");
-	const quotaEntry = findQuotaCacheEntryForAccount(quotaCache, account, allAccounts);
+	const quotaEntry = normalizeQuotaCacheEntryForDisplay(
+		findQuotaCacheEntryForAccount(quotaCache, account, allAccounts),
+		now,
+	);
 	if (quotaEntry?.status === 429 && !markers.some(isRateLimitedMarker)) {
 		markers.push("rate-limited");
 	}

@@ -11,6 +11,7 @@ describe("createAccountCheckWorkingState", () => {
 		expect(state.storageChanged).toBe(false);
 		expect(state.flaggedChanged).toBe(false);
 		expect(state.ok).toBe(0);
+		expect(state.unavailable).toBe(0);
 		expect(state.errors).toBe(0);
 		expect(state.disabled).toBe(0);
 		expect(state.removeFromActive.size).toBe(0);

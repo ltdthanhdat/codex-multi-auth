@@ -5,6 +5,26 @@ export type QuotaCacheAccountRef = Pick<AccountMetadataV3, "accountId" | "email"
 
 type QuotaWindowLike = Pick<QuotaCacheWindow, "usedPercent" | "resetAtMs" | "windowMinutes">;
 
+function quotaWindowHasRolledOver(
+	window: QuotaWindowLike | undefined,
+	now = Date.now(),
+	updatedAt?: number,
+): boolean {
+	if (typeof window?.resetAtMs === "number" && now >= window.resetAtMs) {
+		return true;
+	}
+	if (
+		typeof window?.resetAtMs !== "number" &&
+		typeof updatedAt === "number" &&
+		typeof window?.windowMinutes === "number" &&
+		window.windowMinutes > 0 &&
+		now >= updatedAt + window.windowMinutes * 60_000
+	) {
+		return true;
+	}
+	return false;
+}
+
 export function normalizeQuotaAccountId(value: string | undefined): string | null {
 	const trimmed = value?.trim();
 	return trimmed && trimmed.length > 0 ? trimmed : null;
@@ -79,21 +99,7 @@ function quotaWindowIsExhausted(
 	now = Date.now(),
 	updatedAt?: number,
 ): boolean {
-	if (typeof window?.resetAtMs === "number" && now >= window.resetAtMs) {
-		return false;
-	}
-	// quota-forecast-02: a window can be 100% used with NO resetAtMs. Without a
-	// staleness escape that reads as "exhausted forever". When we know when the
-	// snapshot was taken (updatedAt) and the window length (windowMinutes),
-	// synthesize a conservative expiry: once a full window has elapsed since the
-	// snapshot, the window must have rolled over, so stop treating it as exhausted.
-	if (
-		typeof window?.resetAtMs !== "number" &&
-		typeof updatedAt === "number" &&
-		typeof window?.windowMinutes === "number" &&
-		window.windowMinutes > 0 &&
-		now >= updatedAt + window.windowMinutes * 60_000
-	) {
+	if (quotaWindowHasRolledOver(window, now, updatedAt)) {
 		return false;
 	}
 	const leftPercent = quotaLeftPercentFromUsed(window?.usedPercent);
@@ -111,6 +117,52 @@ export function isQuotaCacheEntryExhausted(
 		quotaWindowIsExhausted(entry?.primary, now, updatedAt) ||
 		quotaWindowIsExhausted(entry?.secondary, now, updatedAt)
 	);
+}
+
+export function normalizeQuotaCacheEntryForDisplay(
+	entry: QuotaCacheEntry | null | undefined,
+	now = Date.now(),
+): QuotaCacheEntry | null {
+	if (!entry) return null;
+
+	const updatedAt = entry.updatedAt;
+	const primaryRolledOver = quotaWindowHasRolledOver(entry.primary, now, updatedAt);
+	const secondaryRolledOver = quotaWindowHasRolledOver(
+		entry.secondary,
+		now,
+		updatedAt,
+	);
+
+	const nextPrimary = primaryRolledOver
+		? {
+				...entry.primary,
+				usedPercent: 0,
+				resetAtMs: undefined,
+			}
+		: entry.primary;
+	const nextSecondary = secondaryRolledOver
+		? {
+				...entry.secondary,
+				usedPercent: 0,
+				resetAtMs: undefined,
+			}
+		: entry.secondary;
+	const nextStatus = entry.status === 429 && primaryRolledOver ? 200 : entry.status;
+
+	if (
+		nextPrimary === entry.primary &&
+		nextSecondary === entry.secondary &&
+		nextStatus === entry.status
+	) {
+		return entry;
+	}
+
+	return {
+		...entry,
+		status: nextStatus,
+		primary: nextPrimary,
+		secondary: nextSecondary,
+	};
 }
 
 export function findQuotaCacheEntryForAccount(

@@ -209,6 +209,42 @@ describe("runStatusCommand", () => {
 		);
 	});
 
+	it("does not keep stale persisted 429 markers after the primary reset passes", async () => {
+		const deps = createStatusDeps({
+			formatRateLimitEntry: vi.fn(() => null),
+			loadQuotaCache: vi.fn(async () => ({
+				byAccountId: {},
+				byEmail: {
+					"one@example.com": {
+						updatedAt: 1_000,
+						status: 429,
+						model: "gpt-5.3-codex",
+						primary: {
+							usedPercent: 100,
+							windowMinutes: 300,
+							resetAtMs: 1_999,
+						},
+						secondary: {
+							usedPercent: 16,
+							windowMinutes: 10080,
+							resetAtMs: 10_000,
+						},
+					},
+				},
+			})),
+			getNow: vi.fn(() => 2_000),
+		});
+
+		await runStatusCommand(deps);
+
+		expect(deps.logInfo).toHaveBeenCalledWith(
+			expect.stringContaining("1. Account 1 (one@example.com) [current]"),
+		);
+		expect(deps.logInfo).not.toHaveBeenCalledWith(
+			expect.stringContaining("1. Account 1 (one@example.com) [current, rate-limited]"),
+		);
+	});
+
 	it("prints the last rotated runtime account when observability has it", async () => {
 		const deps = createStatusDeps({
 			loadRuntimeObservabilitySnapshot: vi.fn(async () =>

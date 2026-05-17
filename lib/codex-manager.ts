@@ -28,6 +28,7 @@ import {
 import { startLocalOAuthServer } from "./auth/server.js";
 import {
 	type ExistingAccountInfo,
+	isNonInteractiveMode,
 	promptAddAnotherAccount,
 	promptLoginMode,
 } from "./cli.js";
@@ -83,6 +84,7 @@ import { runForecastCommand } from "./codex-manager/commands/forecast.js";
 import { runInitConfigCommand } from "./codex-manager/commands/init-config.js";
 import { runReportCommand } from "./codex-manager/commands/report.js";
 import { runRotationCommand } from "./codex-manager/commands/rotation.js";
+import { promptRootCommandTui } from "./codex-manager/commands/root-tui.js";
 import {
 	runFeaturesCommand,
 	runStatusCommand,
@@ -127,6 +129,7 @@ import {
 	summarizeForecast,
 } from "./forecast.js";
 import { createLogger } from "./logger.js";
+import { fetchOfficialCurrentRateLimitsSnapshot } from "./official-rate-limits.js";
 import { MODEL_FAMILIES, type ModelFamily } from "./prompts/codex.js";
 import {
 	getModelCapabilities,
@@ -143,6 +146,7 @@ import {
 	hasSafeQuotaEmailFallback,
 	hasUniqueQuotaAccountId,
 	isQuotaCacheEntryExhausted,
+	normalizeQuotaCacheEntryForDisplay,
 	normalizeQuotaAccountId,
 	normalizeQuotaEmail,
 	quotaLeftPercentFromUsed,
@@ -671,32 +675,33 @@ function getPersistedQuotaViewForAccount(
 	const cachedEntry = cache
 		? getQuotaCacheEntryForAccount(cache, account, accounts, emailFallbackState)
 		: null;
+	const displayEntry = normalizeQuotaCacheEntryForDisplay(cachedEntry, now);
 	const persistedResetAt = getRateLimitResetTimeForFamily(
 		account,
 		now,
 		"codex",
 	);
 	if (typeof persistedResetAt !== "number") {
-		return cachedEntry;
+		return displayEntry;
 	}
-	const cachedPrimaryResetAt = cachedEntry?.primary.resetAtMs ?? 0;
-	const cachedSecondaryResetAt = cachedEntry?.secondary.resetAtMs ?? 0;
+	const cachedPrimaryResetAt = displayEntry?.primary.resetAtMs ?? 0;
+	const cachedSecondaryResetAt = displayEntry?.secondary.resetAtMs ?? 0;
 	if (
-		cachedEntry?.status === 429 &&
+		displayEntry?.status === 429 &&
 		Math.max(cachedPrimaryResetAt, cachedSecondaryResetAt) >= persistedResetAt
 	) {
-		return cachedEntry;
+		return displayEntry;
 	}
 	return {
-		updatedAt: cachedEntry?.updatedAt ?? now,
+		updatedAt: displayEntry?.updatedAt ?? now,
 		status: 429,
-		model: cachedEntry?.model ?? "gpt-5.3-codex",
-		planType: cachedEntry?.planType,
+		model: displayEntry?.model ?? "gpt-5.3-codex",
+		planType: displayEntry?.planType,
 		primary: {
-			...cachedEntry?.primary,
+			...displayEntry?.primary,
 			resetAtMs: Math.max(cachedPrimaryResetAt, persistedResetAt),
 		},
-		secondary: cachedEntry?.secondary ?? {},
+		secondary: displayEntry?.secondary ?? {},
 	};
 }
 
@@ -887,6 +892,7 @@ async function refreshQuotaCacheForMenu(
 	cache: QuotaCacheData,
 	maxAgeMs: number,
 	onProgress?: (current: number, total: number) => void,
+	options?: { preferOfficialRateLimits?: boolean },
 ): Promise<QuotaCacheData> {
 	if (storage.accounts.length === 0) {
 		return cache;
@@ -906,12 +912,30 @@ async function refreshQuotaCacheForMenu(
 	let processed = 0;
 	onProgress?.(processed, total);
 	let changed = false;
-	for (const target of targets) {
+	const preferOfficialRateLimits = options?.preferOfficialRateLimits === true;
+	const originalCodexSelection = preferOfficialRateLimits
+		? getActiveCodexCliSelection(
+				await loadCodexCliState({ forceRefresh: true }).catch(() => null),
+			)
+		: null;
+	try {
+		for (const target of targets) {
 		processed += 1;
 		onProgress?.(processed, total);
 
 		try {
-			const snapshot = await fetchCodexQuotaSnapshot({
+			let snapshot = null;
+			if (preferOfficialRateLimits) {
+				await setCodexCliActiveSelection({
+					accountId: target.account.accountId,
+					email: target.account.email,
+					accessToken: target.account.accessToken,
+					refreshToken: target.account.refreshToken,
+					expiresAt: target.account.expiresAt,
+				});
+				snapshot = await fetchOfficialCurrentRateLimitsSnapshot().catch(() => null);
+			}
+			snapshot ??= await fetchCodexQuotaSnapshot({
 				accountId: target.accountId,
 				accessToken: target.accessToken,
 				model: MENU_QUOTA_REFRESH_MODEL,
@@ -926,6 +950,11 @@ async function refreshQuotaCacheForMenu(
 				) || changed;
 		} catch {
 			// Keep existing cached values if probing fails.
+		}
+	}
+	} finally {
+		if (preferOfficialRateLimits && originalCodexSelection) {
+			await setCodexCliActiveSelection(originalCodexSelection).catch(() => undefined);
 		}
 	}
 
@@ -2036,6 +2065,23 @@ async function runSignInFlow(
 	return runOAuthFlow(forceNewLogin, signInMode);
 }
 
+async function addAccountWithExistingSignInFlow(
+	signInMode: Extract<OAuthSignInMode, "browser" | "manual">,
+): Promise<boolean> {
+	const tokenResult = await runSignInFlow(true, signInMode);
+	if (tokenResult.type !== "success") {
+		console.error(
+			`Add account failed: ${tokenResult.message ?? tokenResult.reason ?? "unknown error"}`,
+		);
+		return false;
+	}
+
+	const resolved = resolveAccountSelection(tokenResult);
+	await persistAccountPool([resolved], false);
+	await syncSelectionToCodex(resolved);
+	return true;
+}
+
 async function persistAccountPool(
 	results: TokenSuccessWithAccount[],
 	replaceAll: boolean,
@@ -2163,6 +2209,35 @@ async function syncSelectionToCodex(
 	});
 }
 
+function getActiveCodexCliSelection(
+	cliState: Awaited<ReturnType<typeof loadCodexCliState>>,
+): {
+	accountId?: string;
+	email?: string;
+	accessToken?: string;
+	refreshToken?: string;
+	expiresAt?: number;
+} | null {
+	if (!cliState) return null;
+	const active =
+		cliState.accounts.find((account) => account.isActive) ??
+		cliState.accounts.find(
+			(account) =>
+				account.accountId === cliState.activeAccountId ||
+				account.email === cliState.activeEmail,
+		);
+	if (!active?.accessToken || !active.refreshToken) {
+		return null;
+	}
+	return {
+		accountId: active.accountId,
+		email: active.email,
+		accessToken: active.accessToken,
+		refreshToken: active.refreshToken,
+		expiresAt: active.expiresAt,
+	};
+}
+
 interface HealthCheckOptions {
 	forceRefresh?: boolean;
 	liveProbe?: boolean;
@@ -2192,6 +2267,7 @@ async function runHealthCheck(options: HealthCheckOptions = {}): Promise<void> {
 
 	let changed = false;
 	let ok = 0;
+	let unavailable = 0;
 	let failed = 0;
 	let warnings = 0;
 	const activeIndex = resolveActiveIndex(storage, "codex");
@@ -2228,6 +2304,8 @@ async function runHealthCheck(options: HealthCheckOptions = {}): Promise<void> {
 				activeAccountRefreshed = true;
 			}
 			let healthDetail = "signed in and working";
+			let lineTone: PromptTone = "success";
+			let lineMarker = "✓";
 			if (liveProbe) {
 				const currentAccessToken = account.accessToken;
 				const probeAccountId = currentAccessToken
@@ -2256,11 +2334,14 @@ async function runHealthCheck(options: HealthCheckOptions = {}): Promise<void> {
 						}
 						healthDetail = formatQuotaSnapshotForDashboard(snapshot, display);
 					} catch (error) {
-						warnings += 1;
 						if (isCodexUnavailableError(error)) {
+							unavailable += 1;
+							lineTone = "warning";
+							lineMarker = "!";
 							healthDetail =
 								`signed in and working (${CODEX_UNAVAILABLE_PROBE_NOTE})`;
 						} else {
+							warnings += 1;
 							const message = normalizeFailureDetail(
 								error instanceof Error ? error.message : String(error),
 								undefined,
@@ -2273,10 +2354,12 @@ async function runHealthCheck(options: HealthCheckOptions = {}): Promise<void> {
 			if (hasLikelyInvalidRefreshToken(account.refreshToken)) {
 				healthDetail += " (re-login suggested soon)";
 			}
-			ok += 1;
+			if (lineMarker === "✓") {
+				ok += 1;
+			}
 			if (display.showPerAccountRows) {
 				console.log(
-					`  ${stylePromptText("✓", "success")} ${labelText} ${stylePromptText("|", "muted")} ${styleAccountDetailText(healthDetail)}`,
+					`  ${stylePromptText(lineMarker, lineTone)} ${labelText} ${stylePromptText("|", "muted")} ${styleAccountDetailText(healthDetail)}`,
 				);
 			}
 			continue;
@@ -2330,8 +2413,9 @@ async function runHealthCheck(options: HealthCheckOptions = {}): Promise<void> {
 			if (i === activeIndex) {
 				activeAccountRefreshed = true;
 			}
-			ok += 1;
 			let healthyMessage = "working now";
+			let lineTone: PromptTone = "success";
+			let lineMarker = "✓";
 			if (liveProbe) {
 				const probeAccountId = account.accountId ?? tokenAccountId;
 				if (!probeAccountId) {
@@ -2357,11 +2441,14 @@ async function runHealthCheck(options: HealthCheckOptions = {}): Promise<void> {
 						}
 						healthyMessage = formatQuotaSnapshotForDashboard(snapshot, display);
 					} catch (error) {
-						warnings += 1;
 						if (isCodexUnavailableError(error)) {
+							unavailable += 1;
+							lineTone = "warning";
+							lineMarker = "!";
 							healthyMessage =
 								`working now (${CODEX_UNAVAILABLE_PROBE_NOTE})`;
 						} else {
+							warnings += 1;
 							const message = normalizeFailureDetail(
 								error instanceof Error ? error.message : String(error),
 								undefined,
@@ -2371,9 +2458,12 @@ async function runHealthCheck(options: HealthCheckOptions = {}): Promise<void> {
 					}
 				}
 			}
+			if (lineMarker === "✓") {
+				ok += 1;
+			}
 			if (display.showPerAccountRows) {
 				console.log(
-					`  ${stylePromptText("✓", "success")} ${labelText} ${stylePromptText("|", "muted")} ${styleAccountDetailText(healthyMessage)}`,
+					`  ${stylePromptText(lineMarker, lineTone)} ${labelText} ${stylePromptText("|", "muted")} ${styleAccountDetailText(healthyMessage)}`,
 				);
 			}
 		} else {
@@ -2441,6 +2531,10 @@ async function runHealthCheck(options: HealthCheckOptions = {}): Promise<void> {
 	console.log(
 		formatResultSummary([
 			{ text: `${ok} working`, tone: "success" },
+			{
+				text: `${unavailable} unavailable`,
+				tone: unavailable > 0 ? "warning" : "muted",
+			},
 			{
 				text: `${failed} need re-login`,
 				tone: failed > 0 ? "danger" : "muted",
@@ -2829,6 +2923,7 @@ async function runAuthLoginFlow(
 					break;
 				}
 				const currentStorage = existingStorage;
+				await syncCodexCliActiveSelectionIfDrifted(currentStorage);
 				const displaySettings = await loadDashboardDisplaySettings();
 				applyUiThemeFromDashboardSettings(displaySettings);
 				const quotaCache = await loadQuotaCache();
@@ -2865,6 +2960,7 @@ async function runAuthLoginFlow(
 								if (!showFetchStatus) return;
 								menuQuotaRefreshStatus = `${UI_COPY.mainMenu.loadingLimits} [${current}/${total}]`;
 							},
+							{ preferOfficialRateLimits: false },
 						)
 							.then(() => {
 								if (refreshGeneration === menuQuotaRefreshGeneration) {
@@ -2880,7 +2976,6 @@ async function runAuthLoginFlow(
 					}
 				}
 				const flaggedStorage = await loadFlaggedAccounts();
-				await syncCodexCliActiveSelectionIfDrifted(currentStorage);
 				const runtimeCurrent = await loadRuntimeCurrentSelectionForStorage(
 					currentStorage,
 				);
@@ -3514,6 +3609,101 @@ function buildSelectAccountTraced(): (
 	};
 }
 
+async function runRootCommandTui(): Promise<number> {
+	const loadRootTuiAccounts = async (): Promise<ExistingAccountInfo[]> => {
+		setStoragePath(null);
+		const storage = await loadAccounts();
+		const currentStorage = storage ?? {
+			version: 3 as const,
+			accounts: [],
+			activeIndex: 0,
+			activeIndexByFamily: {},
+		};
+		await syncCodexCliActiveSelectionIfDrifted(currentStorage);
+		const displaySettings = await loadDashboardDisplaySettings();
+		applyUiThemeFromDashboardSettings(displaySettings);
+		let quotaCache = await loadQuotaCache();
+		if (displaySettings.menuAutoFetchLimits ?? true) {
+			const quotaTtlMs =
+				displaySettings.menuQuotaTtlMs ?? DEFAULT_MENU_QUOTA_REFRESH_TTL_MS;
+			quotaCache = await refreshQuotaCacheForMenu(
+				currentStorage,
+				quotaCache,
+				quotaTtlMs,
+				undefined,
+				{ preferOfficialRateLimits: true },
+			);
+		}
+		const runtimeCurrent = await loadRuntimeCurrentSelectionForStorage(
+			currentStorage,
+		);
+		return toExistingAccountInfo(
+			currentStorage,
+			quotaCache,
+			displaySettings,
+			runtimeCurrent,
+		);
+	};
+
+	while (true) {
+		// Preload Ink module in parallel with account data loading
+		// so WASM compilation and React/Ink JS parsing overlap disk I/O.
+		const accountsPromise = loadRootTuiAccounts();
+		import("./codex-manager/commands/root-tui-ink.js").catch(() => void 0);
+		const action = await promptRootCommandTui(await accountsPromise, {
+			onRefresh: async () => ({
+				accounts: await loadRootTuiAccounts(),
+				statusMessage: "Refreshed account list.",
+				statusTone: "info",
+			}),
+			onSwitch: async (accountIndex) => {
+				let syncWarning: string | null = null;
+				await runSwitchCommand([String(accountIndex + 1)], {
+					setStoragePath,
+					loadAccounts,
+					persistAndSyncSelectedAccount,
+					logInfo: () => {},
+					logWarn: (message) => {
+						syncWarning = message;
+					},
+					logError: (message) => {
+						throw new Error(message);
+					},
+				});
+				const accounts = await loadRootTuiAccounts();
+				const switchedAccount = accounts.find(
+					(account) => account.sourceIndex === accountIndex,
+				);
+				const accountLabel =
+					switchedAccount?.email?.trim() ||
+					switchedAccount?.accountLabel?.trim() ||
+					switchedAccount?.accountId?.trim() ||
+					`account ${String(accountIndex + 1)}`;
+				return {
+					accounts,
+					statusMessage: syncWarning
+						? `${syncWarning}`
+						: `Switched to ${accountLabel}.`,
+					statusTone: syncWarning ? "info" : "success",
+				};
+			},
+		});
+
+		if (action.type === "cancel") {
+			return 0;
+		}
+		if (action.type === "refresh") {
+			continue;
+		}
+		if (action.type === "add") {
+			await addAccountWithExistingSignInFlow(action.signInMode);
+			continue;
+		}
+		// Switch actions are handled inside the TUI when onSwitch is provided here.
+		return 0;
+	}
+}
+
 export async function runCodexMultiAuthCli(rawArgs: string[]): Promise<number> {
 	const startupDisplaySettings = await loadDashboardDisplaySettings();
 	applyUiThemeFromDashboardSettings(startupDisplaySettings);
@@ -3523,6 +3713,9 @@ export async function runCodexMultiAuthCli(rawArgs: string[]): Promise<number> {
 			? ["auth", ...rawArgs]
 			: [...rawArgs];
 	if (args.length === 0) {
+		if (!isNonInteractiveMode()) {
+			return runRootCommandTui();
+		}
 		printUsage();
 		return 0;
 	}
